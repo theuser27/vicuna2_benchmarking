@@ -33,10 +33,12 @@ option(TRACE_FULL "Enable FULL VCD trace outputs" OFF) #TODO: prevent this optio
 # Get current OS distribution for dependency downloads
 ######################
 file(READ "/etc/os-release" OS_REL)
-string(REGEX MATCH "Fedora|Ubuntu" DIST ${OS_REL})
+string(REGEX MATCH "Fedora|Ubuntu|Linux Mint" DIST ${OS_REL})
 
 if(DIST STREQUAL "Ubuntu")
     message(STATUS "Found Ubuntu")
+elseif(DIST STREQUAL "Linux Mint")
+    message(STATUS "Found Linux Mint")
 elseif(DIST STREQUAL "Fedora")
     message(STATUS "Found Fedora")
 else()

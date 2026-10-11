@@ -46,22 +46,22 @@
 	update = none
 [submodule "toolchain/etiss_base/etiss"]
 	path = toolchain/etiss_base/etiss
-	url = git@github.com:danielschloms/etiss.git
+	url = https://github.com/danielschloms/etiss.git
 [submodule "toolchain/etiss_base/M2-ISA-R"]
 	path = toolchain/etiss_base/M2-ISA-R
-	url = git@github.com:tum-ei-eda/M2-ISA-R.git
+	url = https://github.com/tum-ei-eda/M2-ISA-R.git
 [submodule "toolchain/etiss_base/etiss_arch_riscv"]
 	path = toolchain/etiss_base/etiss_arch_riscv
-	url = git@github.com:danielschloms/etiss_arch_riscv.git
+	url = https://github.com/danielschloms/etiss_arch_riscv.git
 [submodule "benchmark_sources/embench_iot/embench-iot"]
 	path = benchmark_sources/embench_iot/embench-iot
 	url = https://github.com/embench/embench-iot.git
 [submodule "toolchain/etiss_base/etiss_perfsim"]
 	path = toolchain/etiss_base/etiss_perfsim
-	url = git@github.com:danielschloms/perfsim_workspace.git
+	url = https://github.com/danielschloms/perfsim_workspace.git
 [submodule "scripts/etiss_perfsim_testing"]
 	path = scripts/etiss_perfsim_testing
-	url = git@github.com:danielschloms/rvv_testing.git
+	url = https://github.com/danielschloms/rvv_testing.git
 [submodule "benchmark_sources/audiomark/audiomark"]
 	path = benchmark_sources/audiomark/audiomark
 	url = https://github.com/eembc/audiomark.git

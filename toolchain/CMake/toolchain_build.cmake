@@ -7,6 +7,10 @@ macro(build_gcc_multilib)
             message(STATUS "Downloading Ubuntu Dependencies")
             execute_process(COMMAND sudo apt-get install autoconf automake autotools-dev curl python3 python3-pip python3-tomli libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev ninja-build git cmake libglib2.0-dev libslirp-dev libncurses-dev
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
+            execute_process(COMMAND sudo apt-get install autoconf automake autotools-dev curl python3 python3-pip python3-tomli libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev ninja-build git cmake libglib2.0-dev libslirp-dev libncurses-dev
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})                            
         elseif(DIST STREQUAL "Fedora")
             message(STATUS "Downloading Fedora Dependencies")
             execute_process(COMMAND sudo yum install autoconf automake python3 libmpc-devel mpfr-devel gmp-devel gawk  bison flex texinfo patchutils gcc gcc-c++ zlib-devel expat-devel libslirp-devel ncurses-devel
@@ -34,11 +38,15 @@ endmacro()
 
 macro(build_gcc_header_only ARCH)
 
-     if(NOT EXISTS "${TOOLCHAIN_TOP}/GCC/${ARCH}")
+    if(NOT EXISTS "${TOOLCHAIN_TOP}/GCC/${ARCH}")
         message("GCC Headers for ${ARCH} not found. Building")
         # Make sure required dependencies are installed for GCC
         if(DIST STREQUAL "Ubuntu")
             message(STATUS "Downloading Ubuntu Dependencies")
+            execute_process(COMMAND sudo apt-get install autoconf automake autotools-dev curl python3 python3-pip python3-tomli libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev ninja-build git cmake libglib2.0-dev libslirp-dev libncurses-dev
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
             execute_process(COMMAND sudo apt-get install autoconf automake autotools-dev curl python3 python3-pip python3-tomli libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev ninja-build git cmake libglib2.0-dev libslirp-dev libncurses-dev
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
         elseif(DIST STREQUAL "Fedora")
@@ -73,6 +81,10 @@ macro(build_llvm)
 
         if(DIST STREQUAL "Ubuntu") #TODO: Find these dependencies
             message(STATUS "Downloading Ubuntu Dependencies")
+            execute_process(COMMAND sudo apt-get install 
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
             execute_process(COMMAND sudo apt-get install 
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
         elseif(DIST STREQUAL "Fedora")
@@ -112,6 +124,10 @@ macro(build_spike)
             message(STATUS "Downloading Ubuntu Dependencies")
             execute_process(COMMAND sudo apt-get install device-tree-compiler libboost-regex-dev libboost-system-dev
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
+            execute_process(COMMAND sudo apt-get install device-tree-compiler libboost-regex-dev libboost-system-dev
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})
         elseif(DIST STREQUAL "Fedora")
             message(STATUS "Downloading Fedora Dependencies")
             execute_process(COMMAND sudo yum install device-tree-compiler libboost-regex-dev libboost-system-dev
@@ -139,6 +155,10 @@ macro(build_verilator)
         # Make sure required dependencies are installed for Verilator
         if(DIST STREQUAL "Ubuntu")
             message(STATUS "Downloading Ubuntu Dependencies")
+            execute_process(COMMAND sudo apt-get install help2man perl python3 make autoconf flex bison
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
             execute_process(COMMAND sudo apt-get install help2man perl python3 make autoconf flex bison
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
         elseif(DIST STREQUAL "Fedora")
@@ -171,6 +191,10 @@ macro(build_gem5) #TODO: Move gem5 submodule to toolchain directory
             message(STATUS "Downloading Ubuntu Dependencies")
             execute_process(COMMAND sudo apt-get install build-essential scons python3-dev git pre-commit zlib1g zlib1g-dev libprotobuf-dev protobuf-compiler libprotoc-dev libgoogle-perftools-dev libboost-all-dev  libhdf5-serial-dev python3-pydot python3-venv python3-tk mypy m4 libcapstone-dev libpng-dev libelf-dev pkg-config wget cmake doxygen clang-format
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
+            execute_process(COMMAND sudo apt-get install build-essential scons python3-dev git pre-commit zlib1g zlib1g-dev libprotobuf-dev protobuf-compiler libprotoc-dev libgoogle-perftools-dev libboost-all-dev  libhdf5-serial-dev python3-pydot python3-venv python3-tk mypy m4 libcapstone-dev libpng-dev libelf-dev pkg-config wget cmake doxygen clang-format
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})
         elseif(DIST STREQUAL "Fedora")
             message(WARNING "Downloading Fedora Dependencies - WARNING THIS IS UNTESTED")
             execute_process(COMMAND sudo yum install build-essential scons python3-dev git pre-commit zlib1g zlib1g-dev libprotobuf-dev protobuf-compiler libprotoc-dev libgoogle-perftools-dev libboost-all-dev  libhdf5-serial-dev python3-pydot python3-venv python3-tk mypy m4 libcapstone-dev libpng-dev libelf-dev pkg-config wget cmake doxygen clang-format
@@ -199,6 +223,10 @@ macro(build_etiss)
         if(DIST STREQUAL "Ubuntu")
             message(STATUS "Downloading Ubuntu Dependencies")
             execute_process(COMMAND sudo apt install build-essential git cmake libboost-filesystem-dev libboost-program-options-dev
+                            WORKING_DIRECTORY ${TOOLCHAIN_TOP})
+        elseif(DIST STREQUAL "Linux Mint")
+            message(STATUS "Downloading Linux Mint Dependencies")
+            execute_process(COMMAND sudo apt install build-essential libboost-all-dev libtinfo-dev zlib1g-dev
                             WORKING_DIRECTORY ${TOOLCHAIN_TOP})
         elseif(DIST STREQUAL "Fedora")
             message(WARNING "Downloading Fedora Dependencies - WARNING THIS IS UNTESTED")

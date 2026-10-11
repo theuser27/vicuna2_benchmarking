@@ -6,7 +6,7 @@
 set(RISCV_ARCH "rv32im_zve32x")
 
 #Currently Supported: cv32e40x, cv32a60x
-set(SCALAR_CORE "cv32a60x")
+set(SCALAR_CORE "cv32e40x")
 
 set(VMEM_PORTS 1)
 set(VMEM_W 32)
