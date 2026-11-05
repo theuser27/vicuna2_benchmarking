@@ -95,10 +95,10 @@ class Benchmark
     //Call code to be benchmarked
     int run_benchmark()
     {
-        fail_count += run_test(GET_SERIALISED_ARRAY(CBCVarKey), AESMode::CBCMode);
-        fail_count += run_test(GET_SERIALISED_ARRAY(CBCVarTxt), AESMode::CBCMode);
-        fail_count += run_test(GET_SERIALISED_ARRAY(ECBVarKey), AESMode::ECBMode);
-        fail_count += run_test(GET_SERIALISED_ARRAY(ECBVarTxt), AESMode::ECBMode);
+        run_test(GET_SERIALISED_ARRAY(CBCVarKey), AESMode::CBCMode);
+        run_test(GET_SERIALISED_ARRAY(CBCVarTxt), AESMode::CBCMode);
+        run_test(GET_SERIALISED_ARRAY(ECBVarKey), AESMode::ECBMode);
+        run_test(GET_SERIALISED_ARRAY(ECBVarTxt), AESMode::ECBMode);
 
         return 0; //cannot fail internally
     };

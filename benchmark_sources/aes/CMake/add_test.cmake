@@ -15,6 +15,7 @@ macro(add_Benchmark_Verilator TEST)
 
     target_include_directories(${TEST_NAME} PRIVATE
         ${AES_TOP}/tiny-AES-c/
+        ${AES_TOP}/generated/
         ${AES_TOP}/benchmarks/${TEST}
         ${FRAMEWORK_TOP}/
     )
@@ -22,7 +23,9 @@ macro(add_Benchmark_Verilator TEST)
     target_sources(${TEST_NAME} PUBLIC
         ${FRAMEWORK_TOP}/main.cpp
         ${AES_TOP}/benchmarks/${TEST}/benchmark.hpp
+        ${AES_TOP}/generated/aes_kat.cpp
     )
+    target_compile_definitions(${TEST_NAME} PUBLIC TEST_AES128=1)
 
     #Set Linker
     target_link_options(${TEST_NAME} PRIVATE "-nostartfiles")
@@ -217,14 +220,17 @@ macro(add_Benchmark_Spike TEST)
 
     target_include_directories(${TEST_NAME} PRIVATE
         ${AES_TOP}/tiny-AES-c/
+        ${AES_TOP}/generated/
         ${AES_TOP}/benchmarks/${TEST}
         ${FRAMEWORK_TOP}/
     )
+    target_compile_definitions(${TEST_NAME} PUBLIC TEST_AES128=1)
 
     target_sources(${TEST_NAME} PUBLIC
         ${FRAMEWORK_TOP}/main.cpp
         ${FRAMEWORK_TOP}/vicuna2_bsp/crt0.S
         ${AES_TOP}/benchmarks/${TEST}/benchmark.hpp
+        ${AES_TOP}/generated/aes_kat.cpp
     )
 
 #     #Set Linker

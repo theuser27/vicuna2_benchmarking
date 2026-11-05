@@ -190,7 +190,7 @@ const size_t {name}_count =
     sizeof({name}) / sizeof({name}[0]);
 """)
 
-    source = f'This file is generated. Do NOT edit!\n#include "{header_name}"\n\n'
+    source = f'// This file is generated. Do NOT edit!\n#include "{header_name}"\n\n'
     source += "\n".join(sections)
 
     path.write_text(source, encoding="utf-8")
