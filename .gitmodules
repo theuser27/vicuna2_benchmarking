@@ -65,3 +65,6 @@
 [submodule "benchmark_sources/audiomark/audiomark"]
 	path = benchmark_sources/audiomark/audiomark
 	url = https://github.com/eembc/audiomark.git
+[submodule "benchmark_sources/aes/tiny-AES-c"]
+	path = benchmark_sources/aes/tiny-AES-c
+	url = https://github.com/kokke/tiny-AES-c.git
