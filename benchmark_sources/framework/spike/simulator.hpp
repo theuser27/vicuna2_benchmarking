@@ -46,6 +46,8 @@ class Simulator
             __asm__ volatile("sw t0, 0(t1)");
             __asm__ volatile("jalr x0, 4(t2)");
         }
+
+        return 0;
     };
 
     //Cleanup any allocatations

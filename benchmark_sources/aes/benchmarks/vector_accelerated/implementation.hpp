@@ -2,25 +2,24 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+#include <riscv_vector.h>
+
+#ifndef __riscv_vector
+    #error "Compile this file with vector extension enabled (e.g. -march=rv32imv)"
+#endif
 
 void aes128_ecb_encrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[16]);
-void aes192_ecb_encrypt_rvv(const uint8_t *input, uint8_t *output,
-                            size_t nblocks, const uint8_t key[24]);
 void aes256_ecb_encrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[32]);
 void aes128_ecb_decrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[16]);
-void aes192_ecb_decrypt_rvv(const uint8_t *input, uint8_t *output,
-                            size_t nblocks, const uint8_t key[24]);
 void aes256_ecb_decrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[32]);
 
 void aes128_cbc_encrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[16],
-                            const uint8_t iv[16]);
-void aes192_cbc_encrypt_rvv(const uint8_t *input, uint8_t *output,
-                            size_t nblocks, const uint8_t key[24],
                             const uint8_t iv[16]);
 void aes256_cbc_encrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[32],
@@ -28,19 +27,9 @@ void aes256_cbc_encrypt_rvv(const uint8_t *input, uint8_t *output,
 void aes128_cbc_decrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[16],
                             const uint8_t iv[16]);
-void aes192_cbc_decrypt_rvv(const uint8_t *input, uint8_t *output,
-                            size_t nblocks, const uint8_t key[24],
-                            const uint8_t iv[16]);
 void aes256_cbc_decrypt_rvv(const uint8_t *input, uint8_t *output,
                             size_t nblocks, const uint8_t key[32],
                             const uint8_t iv[16]);
-
-#ifndef __riscv_vector
-#error "Compile this file with vector extension enabled (e.g. -march=rv32imv)"
-#endif
-
-#include <riscv_vector.h>
-#include <string.h>
 
 /* Standard AES S-box. */
 static const uint8_t aes_sbox[256] = {
@@ -178,9 +167,10 @@ static inline vuint8m8_t aes_mixcolumns_rvv(
  * because each CBC ciphertext depends on the previous ciphertext.
  */
 static void aes_encrypt_rvv(const uint8_t *input, uint8_t *output,
-                            size_t nblocks, const uint8_t round_keys[240],
+                            size_t n, const uint8_t round_keys[240],
                             unsigned nr, const uint8_t *iv)
 {
+    size_t nblocks = n / 16;
     if (nblocks == 0)
         return;
 
@@ -325,9 +315,10 @@ static inline vuint8m8_t aes_inv_mixcolumns_rvv(
  * across blocks; each result is XORed with its previous ciphertext block.
  */
 static void aes_decrypt_rvv(const uint8_t *input, uint8_t *output,
-                            size_t nblocks, const uint8_t round_keys[240],
+                            size_t n, const uint8_t round_keys[240],
                             unsigned nr, const uint8_t *iv)
 {
+    size_t nblocks = n / 16;
     if (nblocks == 0)
         return;
 
@@ -422,50 +413,48 @@ static void aes_decrypt_rvv(const uint8_t *input, uint8_t *output,
     }
 }
 
-#define DEFINE_AES_MODE_FUNCS(bits, nk, keylen)                                      \
+#define DEFINE_AES_ENCRYPT_FUNCS(bits, nk, keylen)                                   \
     void aes##bits##_ecb_encrypt_rvv(const uint8_t *input, uint8_t *output,          \
-                                     size_t nblocks, const uint8_t key[keylen])      \
+                                     size_t n, const uint8_t key[keylen])      \
     {                                                                                 \
-        if (nblocks == 0) return;                                                      \
+        if (n == 0) return;                                                      \
         uint8_t round_keys[240];                                                       \
         unsigned nr = aes_expand_key(key, nk, round_keys);                             \
-        aes_encrypt_rvv(input, output, nblocks, round_keys, nr, NULL);                 \
+        aes_encrypt_rvv(input, output, n, round_keys, nr, NULL);                 \
     }                                                                                 \
     void aes##bits##_cbc_encrypt_rvv(const uint8_t *input, uint8_t *output,           \
-                                     size_t nblocks, const uint8_t key[keylen],       \
+                                     size_t n, const uint8_t key[keylen],       \
                                      const uint8_t iv[16])                            \
     {                                                                                 \
-        if (nblocks == 0) return;                                                      \
+        if (n == 0) return;                                                      \
         uint8_t round_keys[240];                                                       \
         unsigned nr = aes_expand_key(key, nk, round_keys);                             \
-        aes_encrypt_rvv(input, output, nblocks, round_keys, nr, iv);                  \
+        aes_encrypt_rvv(input, output, n, round_keys, nr, iv);                  \
     }
 
-DEFINE_AES_MODE_FUNCS(128, 4, 16)
-DEFINE_AES_MODE_FUNCS(192, 6, 24)
-DEFINE_AES_MODE_FUNCS(256, 8, 32)
+DEFINE_AES_ENCRYPT_FUNCS(128, 4, 16)
+DEFINE_AES_ENCRYPT_FUNCS(256, 8, 32)
 
-#define DEFINE_AES_DECRYPT_FUNCS(bits, nk, keylen)                                  \
-    void aes##bits##_ecb_decrypt_rvv(const uint8_t *input, uint8_t *output,          \
-                                     size_t nblocks, const uint8_t key[keylen])      \
-    {                                                                                 \
-        if (nblocks == 0) return;                                                      \
-        uint8_t round_keys[240];                                                       \
-        unsigned nr = aes_expand_key(key, nk, round_keys);                             \
-        aes_decrypt_rvv(input, output, nblocks, round_keys, nr, NULL);                 \
-    }                                                                                 \
-    void aes##bits##_cbc_decrypt_rvv(const uint8_t *input, uint8_t *output,           \
-                                     size_t nblocks, const uint8_t key[keylen],       \
-                                     const uint8_t iv[16])                            \
-    {                                                                                 \
-        if (nblocks == 0) return;                                                      \
-        uint8_t round_keys[240];                                                       \
-        unsigned nr = aes_expand_key(key, nk, round_keys);                             \
-        aes_decrypt_rvv(input, output, nblocks, round_keys, nr, iv);                  \
+#define DEFINE_AES_DECRYPT_FUNCS(bits, nk, keylen)                              \
+    void aes##bits##_ecb_decrypt_rvv(const uint8_t *input, uint8_t *output,     \
+                                     size_t n, const uint8_t key[keylen])       \
+    {                                                                           \
+        if (n == 0) return;                                                     \
+        uint8_t round_keys[240];                                                \
+        unsigned nr = aes_expand_key(key, nk, round_keys);                      \
+        aes_decrypt_rvv(input, output, n, round_keys, nr, NULL);                \
+    }                                                                           \
+    void aes##bits##_cbc_decrypt_rvv(const uint8_t *input, uint8_t *output,     \
+                                     size_t n, const uint8_t key[keylen],       \
+                                     const uint8_t iv[16])                      \
+    {                                                                           \
+        if (n == 0) return;                                                     \
+        uint8_t round_keys[240];                                                \
+        unsigned nr = aes_expand_key(key, nk, round_keys);                      \
+        aes_decrypt_rvv(input, output, n, round_keys, nr, iv);                  \
     }
 
 DEFINE_AES_DECRYPT_FUNCS(128, 4, 16)
-DEFINE_AES_DECRYPT_FUNCS(192, 6, 24)
 DEFINE_AES_DECRYPT_FUNCS(256, 8, 32)
 
 #undef DEFINE_AES_DECRYPT_FUNCS

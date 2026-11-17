@@ -1,527 +1,947 @@
-/*
- * AES-128/192/256 ECB and CBC encryption for RVV + Zvkned.
- *
- * ECB API:
- *   aes128_ecb_encrypt_zvkned(in, out, nblocks, key16);
- *   aes192_ecb_encrypt_zvkned(in, out, nblocks, key24);
- *   aes256_ecb_encrypt_zvkned(in, out, nblocks, key32);
- * CBC API has the same arguments plus a 16-byte IV at the end.
- *
- * Build with a toolchain implementing the ratified RVV and Zvkned C
- * intrinsics, e.g. -march=rv32imv_zvkned -mabi=ilp32.
- *
- * Encrypts nblocks complete 16-byte blocks; no padding is added. Exact
- * in-place operation (input == output) is supported; partial overlap is not.
- * CBC copies the IV at entry and encrypts blocks serially because of chaining.
- *
- * Encryption rounds use vaesz.vs, vaesem.vs, and vaesef.vs intrinsics. AES-128
- * and AES-256 key schedules use vaeskf1.vi and vaeskf2.vi; AES-192 has no
- * dedicated Zvkned key-schedule instruction and uses a table-free software
- * schedule.
- */
-
 #pragma once
 
 #include <stddef.h>
 #include <stdint.h>
-
-/* Encrypt or decrypt nblocks complete 16-byte AES-ECB blocks. No padding is added.
- * Exact in-place operation (input == output) is supported; partial overlap
- * is not supported. This implementation requires RVV + Zvkned at runtime.
- */
-void aes128_ecb_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[16]);
-void aes192_ecb_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24]);
-void aes256_ecb_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[32]);
-void aes128_ecb_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[16]);
-void aes192_ecb_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24]);
-void aes256_ecb_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[32]);
-
-
-/* Encrypt or decrypt nblocks complete 16-byte AES-CBC blocks. No padding is added.
- * iv is the 16-byte CBC initialization vector. The IV is copied at entry;
- * exact in-place input/output is supported, partial overlap is not.
- * CBC blocks in a single message are inherently serial due to chaining.
- */
-void aes128_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[16],
-                               const uint8_t iv[16]);
-void aes192_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24],
-                               const uint8_t iv[16]);
-void aes256_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[32],
-                               const uint8_t iv[16]);
-void aes128_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[16],
-                               const uint8_t iv[16]);
-void aes192_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24],
-                               const uint8_t iv[16]);
-void aes256_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[32],
-                               const uint8_t iv[16]);
-
+#include <string.h>
 #include <riscv_vector.h>
 
 #ifndef __riscv_zvkned
-#error "Compile this file with Zvkned enabled (e.g. -march=rv32imv_zvkned)"
+    #error "Compile this file with Zvkned enabled (e.g. -march=rv32imv_zvkned)"
 #endif
 
-/* Constant-time GF(2^8) multiplication, polynomial x^8+x^4+x^3+x+1. */
-static uint8_t aes_gf_mul(uint8_t a, uint8_t b)
-{
-    uint8_t p = 0;
-    for (unsigned i = 0; i < 8; ++i) {
-        const uint8_t b_mask = (uint8_t)(0u - (unsigned)(b & 1u));
-        const uint8_t hi_mask = (uint8_t)(0u - (unsigned)(a >> 7));
-        p ^= (uint8_t)(a & b_mask);
-        a = (uint8_t)((uint8_t)(a << 1) ^ (uint8_t)(0x1bu & hi_mask));
-        b >>= 1;
-    }
-    return p;
-}
-
-static uint8_t aes_rotl8(uint8_t x, unsigned n)
-{
-    return (uint8_t)(((unsigned)x << n) | ((unsigned)x >> (8u - n)));
-}
-
-/* AES S-box without secret-indexed memory accesses. */
-static uint8_t aes_sbox_ct(uint8_t x)
-{
-    const uint8_t x2   = aes_gf_mul(x, x);
-    const uint8_t x4   = aes_gf_mul(x2, x2);
-    const uint8_t x8   = aes_gf_mul(x4, x4);
-    const uint8_t x16  = aes_gf_mul(x8, x8);
-    const uint8_t x32  = aes_gf_mul(x16, x16);
-    const uint8_t x64  = aes_gf_mul(x32, x32);
-    const uint8_t x128 = aes_gf_mul(x64, x64);
-    uint8_t inv = aes_gf_mul(x128, x64); /* x^192 */
-    inv = aes_gf_mul(inv, x32);          /* x^224 */
-    inv = aes_gf_mul(inv, x16);          /* x^240 */
-    inv = aes_gf_mul(inv, x8);           /* x^248 */
-    inv = aes_gf_mul(inv, x4);           /* x^252 */
-    inv = aes_gf_mul(inv, x2);           /* x^254; zero maps to zero */
-
-    return (uint8_t)(inv ^ aes_rotl8(inv, 1) ^ aes_rotl8(inv, 2) ^
-                     aes_rotl8(inv, 3) ^ aes_rotl8(inv, 4) ^ 0x63u);
-}
-
-/* Constant-time software AES key expansion. Used for AES-192. */
-static unsigned aes_expand_key_software(const uint8_t *key,
-                                        unsigned key_bytes,
-                                        uint8_t round_keys[15][16])
-{
-    const unsigned nk = key_bytes / 4u;
-    const unsigned nr = nk + 6u;
-    const unsigned total_words = 4u * (nr + 1u);
-    uint8_t *rk = &round_keys[0][0];
-    uint8_t rcon = 1;
-
-    for (unsigned i = 0; i < key_bytes; ++i)
-        rk[i] = key[i];
-
-    for (unsigned i = nk; i < total_words; ++i) {
-        uint8_t t[4];
-        for (unsigned j = 0; j < 4; ++j)
-            t[j] = rk[4u * (i - 1u) + j];
-
-        if ((i % nk) == 0) {
-            const uint8_t first = t[0];
-            t[0] = (uint8_t)(aes_sbox_ct(t[1]) ^ rcon);
-            t[1] = aes_sbox_ct(t[2]);
-            t[2] = aes_sbox_ct(t[3]);
-            t[3] = aes_sbox_ct(first);
-            rcon = (uint8_t)((rcon << 1) ^
-                             ((rcon & 0x80u) ? 0x1bu : 0u));
-        } else if (nk > 6u && (i % nk) == 4u) {
-            for (unsigned j = 0; j < 4; ++j)
-                t[j] = aes_sbox_ct(t[j]);
-        }
-
-        for (unsigned j = 0; j < 4; ++j)
-            rk[4u * i + j] = (uint8_t)(rk[4u * (i - nk) + j] ^ t[j]);
-    }
-
-    return nr;
-}
-
-/* Load one 128-bit key into the low element group of a vector register. */
-static inline vuint32m1_t aes_load_round_key(const uint8_t *key)
-{
-    vuint8m1_t bytes = __riscv_vle8_v_u8m1(key, 16);
-    return __riscv_vreinterpret_v_u8m1_u32m1(bytes);
-}
-
-static inline void aes_store_round_key(uint8_t out[16], vuint32m1_t key)
-{
-    vuint8m1_t bytes = __riscv_vreinterpret_v_u32m1_u8m1(key);
-    __riscv_vse8_v_u8m1(out, bytes, 16);
-}
-
-/* AES-128 key expansion with the Zvkned vaeskf1.vi instruction. */
-static void aes_expand_key_128_zvkned(const uint8_t key[16],
-                                      uint8_t round_keys[15][16])
-{
-    vuint32m1_t current = aes_load_round_key(key);
-    for (unsigned i = 0; i < 16; ++i)
-        round_keys[0][i] = key[i];
-
-    /* The round number is an instruction immediate, so these are unrolled. */
-#define AES128_KS_STEP(R) do {                                      \
-        current = __riscv_vaeskf1_vi_u32m1(current, R, 4);           \
-        aes_store_round_key(round_keys[(R)], current);               \
-    } while (0)
-    AES128_KS_STEP(1);
-    AES128_KS_STEP(2);
-    AES128_KS_STEP(3);
-    AES128_KS_STEP(4);
-    AES128_KS_STEP(5);
-    AES128_KS_STEP(6);
-    AES128_KS_STEP(7);
-    AES128_KS_STEP(8);
-    AES128_KS_STEP(9);
-    AES128_KS_STEP(10);
-#undef AES128_KS_STEP
-}
-
-/* AES-256 key expansion with vaeskf2.vi. Rounds 2..14 generate K2..K14. */
-static void aes_expand_key_256_zvkned(const uint8_t key[32],
-                                      uint8_t round_keys[15][16])
-{
-    vuint32m1_t previous = aes_load_round_key(key);
-    vuint32m1_t current = aes_load_round_key(key + 16);
-    vuint32m1_t next;
-
-    for (unsigned i = 0; i < 16; ++i) {
-        round_keys[0][i] = key[i];
-        round_keys[1][i] = key[16 + i];
-    }
-
-    /* vaeskf2.vi uses vd as the previous key and vs2 as the current key. */
-#define AES256_KS_STEP(R) do {                                      \
-        next = __riscv_vaeskf2_vi_u32m1(previous, current, R, 4);    \
-        previous = current;                                         \
-        current = next;                                              \
-        aes_store_round_key(round_keys[(R)], current);               \
-    } while (0)
-    AES256_KS_STEP(2);
-    AES256_KS_STEP(3);
-    AES256_KS_STEP(4);
-    AES256_KS_STEP(5);
-    AES256_KS_STEP(6);
-    AES256_KS_STEP(7);
-    AES256_KS_STEP(8);
-    AES256_KS_STEP(9);
-    AES256_KS_STEP(10);
-    AES256_KS_STEP(11);
-    AES256_KS_STEP(12);
-    AES256_KS_STEP(13);
-    AES256_KS_STEP(14);
-#undef AES256_KS_STEP
-}
-
-static void aes_ecb_encrypt_zvkned_core(const uint8_t *input,
-                                        uint8_t *output,
-                                        size_t nblocks,
-                                        const uint8_t round_keys[15][16],
-                                        unsigned nr)
-{
-    /* A 128-bit AES block is four e32 elements. m8 allows multiple blocks
-       in one vector register group; max_blocks adapts to the hardware VLEN. */
-    const size_t max_blocks = __riscv_vsetvlmax_e32m8() / 4u;
-
-    while (nblocks != 0) {
-        const size_t blocks = nblocks < max_blocks ? nblocks : max_blocks;
-        const size_t vl_words = __riscv_vsetvl_e32m8(blocks * 4u);
-        const size_t vl_bytes = vl_words * 4u;
-        vuint8m8_t state_bytes = __riscv_vle8_v_u8m8(input, vl_bytes);
-        vuint32m8_t state = __riscv_vreinterpret_v_u8m8_u32m8(state_bytes);
-        vuint32m1_t rk;
-
-        /* Round zero: AddRoundKey. One 128-bit key is shared across all blocks. */
-        rk = aes_load_round_key(round_keys[0]);
-        state = __riscv_vaesz_vs_u32m8_u32m1(state, rk, vl_words);
-
-        /* Middle rounds include MixColumns. */
-        for (unsigned round = 1; round < nr; ++round) {
-            rk = aes_load_round_key(round_keys[round]);
-            state = __riscv_vaesem_vs_u32m8_u32m1(state, rk, vl_words);
-        }
-
-        /* Final round omits MixColumns. */
-        rk = aes_load_round_key(round_keys[nr]);
-        state = __riscv_vaesef_vs_u32m8_u32m1(state, rk, vl_words);
-
-        state_bytes = __riscv_vreinterpret_v_u32m8_u8m8(state);
-        __riscv_vse8_v_u8m8(output, state_bytes, vl_bytes);
-
-        input += blocks * 16u;
-        output += blocks * 16u;
-        nblocks -= blocks;
-    }
-}
-
 void aes128_ecb_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0)
-        return;
-    aes_expand_key_128_zvkned(key, round_keys);
-    aes_ecb_encrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 10);
-}
-
-void aes192_ecb_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0)
-        return;
-    (void)aes_expand_key_software(key, 24, round_keys);
-    aes_ecb_encrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 12);
-}
-
+                               size_t nblocks, const uint8_t key[16]);
 void aes256_ecb_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[32])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0)
-        return;
-    aes_expand_key_256_zvkned(key, round_keys);
-    aes_ecb_encrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 14);
-}
-
-
-static void aes_ecb_decrypt_zvkned_core(const uint8_t *input,
-                                        uint8_t *output,
-                                        size_t nblocks,
-                                        const uint8_t round_keys[15][16],
-                                        unsigned nr);
-
+                               size_t nblocks, const uint8_t key[32]);
 void aes128_ecb_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0) return;
-    aes_expand_key_128_zvkned(key, round_keys);
-    aes_ecb_decrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 10);
-}
-
-void aes192_ecb_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0) return;
-    (void)aes_expand_key_software(key, 24, round_keys);
-    aes_ecb_decrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 12);
-}
-
+                               size_t nblocks, const uint8_t key[16]);
 void aes256_ecb_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[32])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0) return;
-    aes_expand_key_256_zvkned(key, round_keys);
-    aes_ecb_decrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 14);
-}
-
-
-/*
- * Shared Zvkned AES decryption core. AES decryption starts with AddRoundKey
- * using the final encryption round key, then walks the encryption round keys
- * backwards through vaesdm, finishing with vaesdf and round key zero.
- */
-static void aes_ecb_decrypt_zvkned_core(const uint8_t *input,
-                                        uint8_t *output,
-                                        size_t nblocks,
-                                        const uint8_t round_keys[15][16],
-                                        unsigned nr)
-{
-    const size_t max_blocks = __riscv_vsetvlmax_e32m8() / 4u;
-
-    while (nblocks != 0) {
-        const size_t blocks = nblocks < max_blocks ? nblocks : max_blocks;
-        const size_t vl_words = __riscv_vsetvl_e32m8(blocks * 4u);
-        const size_t vl_bytes = vl_words * 4u;
-        vuint8m8_t state_bytes = __riscv_vle8_v_u8m8(input, vl_bytes);
-        vuint32m8_t state = __riscv_vreinterpret_v_u8m8_u32m8(state_bytes);
-        vuint32m1_t rk = aes_load_round_key(round_keys[nr]);
-
-        /* Initial AddRoundKey with K[Nr]. */
-        state = __riscv_vaesz_vs_u32m8_u32m1(state, rk, vl_words);
-
-        /* Inverse middle rounds consume K[Nr-1] down to K[1]. */
-        for (unsigned round = nr - 1; round > 0; --round) {
-            rk = aes_load_round_key(round_keys[round]);
-            state = __riscv_vaesdm_vs_u32m8_u32m1(state, rk, vl_words);
-        }
-
-        /* Final inverse round with K[0], without InvMixColumns. */
-        rk = aes_load_round_key(round_keys[0]);
-        state = __riscv_vaesdf_vs_u32m8_u32m1(state, rk, vl_words);
-
-        state_bytes = __riscv_vreinterpret_v_u32m8_u8m8(state);
-        __riscv_vse8_v_u8m8(output, state_bytes, vl_bytes);
-
-        input += blocks * 16u;
-        output += blocks * 16u;
-        nblocks -= blocks;
-    }
-}
-
-static void aes_cbc_decrypt_zvkned_core(const uint8_t *input,
-                                        uint8_t *output,
-                                        size_t nblocks,
-                                        const uint8_t round_keys[15][16],
-                                        unsigned nr,
-                                        const uint8_t iv[16])
-{
-    uint8_t chain[16];
-    memcpy(chain, iv, 16); /* Preserve IV if it aliases output. */
-
-    size_t max_blocks = __riscv_vsetvlmax_e32m8() / 4u;
-    if (max_blocks > 16u)
-        max_blocks = 16u; /* Bound the scratch space to 256 bytes. */
-
-    while (nblocks != 0) {
-        const size_t blocks = nblocks < max_blocks ? nblocks : max_blocks;
-        const size_t bytes = blocks * 16u;
-        uint8_t ciphertext[256];
-        uint8_t previous_ciphertext[256];
-
-        /* Preserve this batch first, so exact in-place decryption is safe. */
-        memcpy(ciphertext, input, bytes);
-        memcpy(previous_ciphertext, chain, 16);
-        if (blocks > 1u)
-            memcpy(previous_ciphertext + 16, ciphertext, bytes - 16u);
-
-        aes_ecb_decrypt_zvkned_core(ciphertext, output, blocks, round_keys, nr);
-        for (size_t i = 0; i < bytes; ++i)
-            output[i] ^= previous_ciphertext[i];
-
-        /* Chain from the last input ciphertext, never from plaintext output. */
-        memcpy(chain, ciphertext + bytes - 16u, 16);
-        input += bytes;
-        output += bytes;
-        nblocks -= blocks;
-    }
-}
-
-/*
- * CBC encryption core. CBC has a data dependency between consecutive blocks:
- * C[i] = AES_K(P[i] XOR C[i-1]), with C[-1] = IV. Consequently, blocks from
- * one CBC message cannot be encrypted in parallel as they are in ECB. Reuse
- * the Zvkned ECB core one block at a time; each AES block is still processed
- * by the vector AES instructions.
- */
-static void aes_cbc_encrypt_zvkned_core(const uint8_t *input,
-                                        uint8_t *output,
-                                        size_t nblocks,
-                                        const uint8_t round_keys[15][16],
-                                        unsigned nr,
-                                        const uint8_t iv[16])
-{
-    uint8_t chain[16];
-    for (unsigned i = 0; i < 16; ++i)
-        chain[i] = iv[i]; /* Copy IV before writing output; IV may alias output. */
-
-    while (nblocks != 0) {
-        uint8_t mixed[16];
-
-        /* Save the XOR result before writing output, so exact in-place works. */
-        for (unsigned i = 0; i < 16; ++i)
-            mixed[i] = (uint8_t)(input[i] ^ chain[i]);
-
-        aes_ecb_encrypt_zvkned_core(mixed, output, 1, round_keys, nr);
-
-        /* The ciphertext of this block becomes the chaining value. */
-        for (unsigned i = 0; i < 16; ++i)
-            chain[i] = output[i];
-
-        input += 16;
-        output += 16;
-        --nblocks;
-    }
-}
+                               size_t nblocks, const uint8_t key[32]);
 
 void aes128_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
                                size_t nblocks, const uint8_t key[16],
-                               const uint8_t iv[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0)
-        return;
-    aes_expand_key_128_zvkned(key, round_keys);
-    aes_cbc_encrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 10, iv);
-}
-
-void aes192_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24],
-                               const uint8_t iv[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0)
-        return;
-    (void)aes_expand_key_software(key, 24, round_keys);
-    aes_cbc_encrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 12, iv);
-}
-
+                               const uint8_t iv[16]);
 void aes256_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
                                size_t nblocks, const uint8_t key[32],
-                               const uint8_t iv[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0)
-        return;
-    aes_expand_key_256_zvkned(key, round_keys);
-    aes_cbc_encrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 14, iv);
-}
-
+                               const uint8_t iv[16]);
 void aes128_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
                                size_t nblocks, const uint8_t key[16],
-                               const uint8_t iv[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0) return;
-    aes_expand_key_128_zvkned(key, round_keys);
-    aes_cbc_decrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 10, iv);
-}
-
-void aes192_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
-                               size_t nblocks, const uint8_t key[24],
-                               const uint8_t iv[16])
-{
-    uint8_t round_keys[15][16];
-    if (nblocks == 0) return;
-    (void)aes_expand_key_software(key, 24, round_keys);
-    aes_cbc_decrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 12, iv);
-}
-
+                               const uint8_t iv[16]);
 void aes256_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
                                size_t nblocks, const uint8_t key[32],
-                               const uint8_t iv[16])
+                               const uint8_t iv[16]);
+
+#define ZVKNED_NAKED __attribute__((naked, noinline, used, aligned(4)))
+#define UNUSED __attribute__((unused))
+
+// inline assembly functions adapted from 
+// https://github.com/riscv/riscv-crypto/blob/9cb90879050f68de8ba0b2f8bc34bec599ac8025/doc/vector/code-samples/zvkned.s
+
+
+inline ZVKNED_NAKED void zvkned_aes128_expand_key(uint8_t dest_key[176] UNUSED, const uint8_t key[16] UNUSED)
 {
-    uint8_t round_keys[15][16];
-    if (nblocks == 0) return;
-    aes_expand_key_256_zvkned(key, round_keys);
-    aes_cbc_decrypt_zvkned_core(input, output, nblocks,
-                                (const uint8_t (*)[16])round_keys, 14, iv);
+    __asm__ volatile (
+        // 4: number of 4B elements (4B*4 = 16B = 128b)
+        // e32: vector of 32b/4B elements
+        // m1: LMUL=4  (allows for VLEN=32)
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // x0 is not written, we known the number of vector elements, 4.
+        "vsetivli x0, 4, e32, m4, ta, ma\n\t"   // Vectors of 8b
+
+        // Note that this version interleaves the key schedule instructions
+        // and storing the resulting round keys, while always using the same
+        // vector register. Depending on micro-architecture (latencies,
+        // in order vs. out of order, renaming limits, etc), it could
+        // be beneficial to use more registers push stores further from
+        // the key schedule logic.
+
+        // Load user key from `key`, all 16B at once
+        "vle32.v v4, (a1)\n\t"
+        // v4 contains the evolving key state during expansion.
+
+        // Initial word, copy the input key.
+        "vse32.v v4, (a0)\n\t"  // w[0,3] expanded word (== input key)
+        // Round 1
+        "vaeskf1.vi v4, v4, 1\n\t"
+        // Move dest by 128b (4 * 32b  words)
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"  // Round 1 expanded key
+        // Round 2
+        "vaeskf1.vi v4, v4, 2\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 3
+        "vaeskf1.vi v4, v4, 3\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 4
+        "vaeskf1.vi v4, v4, 4\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 5
+        "vaeskf1.vi v4, v4, 5\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 6
+        "vaeskf1.vi v4, v4, 6\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 7
+        "vaeskf1.vi v4, v4, 7\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 8
+        "vaeskf1.vi v4, v4, 8\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 9
+        "vaeskf1.vi v4, v4, 9\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+        // Round 10
+        "vaeskf1.vi v4, v4, 10\n\t"
+        "add a0, a0, 16\n\t"
+        "vse32.v v4, (a0)\n\t"
+
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED void zvkned_aes256_expand_key(uint8_t dest_key[240] UNUSED, const uint8_t key[32] UNUSED)
+{
+    __asm__ __volatile__ (
+        // 4: number of 4B elements (4B*4 = 16B = 128b)
+        // e32: vector of 32b/4B elements
+        // m1: LMUL=4  (allows for VLEN=32)
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // x0 is not written, we known the number of vector elements, 2.
+        "vsetivli x0, 4, e32, m4, ta, ma\n\t"   // Vectors of 4B
+
+        // Load user key from `key`, all 16B at once
+        "vle32.v v4, (a1)\n\t"
+        "addi a1, a1, 16\n\t"
+        "vle32.v v8, (a1)\n\t"
+        "addi a1, a1, 16\n\t"
+
+        // v4 and v8 contain the evolving key state during expansion,
+        // alternating holding key[i] and key[i-1] as inputs to vaeskf.
+
+        // For the initial 2 4-words, we copy the input key.
+        // Round 0 expanded key, w[0, 3] (== input key LO).
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 1 expanded key, w[4, 7] (== input key HI)
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 2 expanded key, w[8, 13].
+        "vaeskf2.vi v4, v8, 2\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 3 expanded key, w[12, 15].
+        "vaeskf2.vi v8, v4, 3\n\t"
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 4 expanded key, w[16, 19].
+        "vaeskf2.vi v4, v8, 4\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 5 expanded key, w[20, 23].
+        "vaeskf2.vi v8, v4, 5\n\t"
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 6 expanded key, w[24, 27].
+        "vaeskf2.vi v4, v8, 6\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 7 expanded key, w[28, 31].
+        "vaeskf2.vi v8, v4, 7\n\t"
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 8 expanded key, w[32, 35].
+        "vaeskf2.vi v4, v8, 8\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 9 expanded key, w[36, 39].
+        "vaeskf2.vi v8, v4, 9\n\t"
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 10 expanded key, w[40, 43].
+        "vaeskf2.vi v4, v8, 10\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 11 expanded key, w[44, 47].
+        "vaeskf2.vi v8, v4, 11\n\t"
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 12 expanded key, w[48, 51].
+        "vaeskf2.vi v4, v8, 12\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 13 expanded key, w[52, 55].
+        "vaeskf2.vi v8, v4, 13\n\t"
+        "vse32.v v8, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+        // Round 14 expanded key, w[56, 59].
+        "vaeskf2.vi v4, v8, 14\n\t"
+        "vse32.v v4, (a0)\n\t"
+        "add a0, a0, 16\n\t"
+
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED size_t zvkned_aes128_encode_vs_lmul1(void *dest UNUSED, 
+    const void *src UNUSED, size_t n UNUSED, const uint8_t *round_keys UNUSED)
+{
+    __asm__ __volatile__ (
+        // a2 on input is number of bytes of the plaintext. We round it down
+        // to a multiple of 16 bytes (128b), keep that in t0 that we return.
+        "andi t0, a2, -16\n\t"  // 0xFF0 in two's complement, clear low 4 bits.
+        "beqz t0, 2f\n\t"  // Early exit in the "0 bytes to process" case
+        // t3 <- t0 / 4, number of remaining 4B elements
+        "srli t3, t0, 2\n\t"
+
+        // We load the 11 round keys into 11 vector registers, v10-v20,
+        // with the 16B (4x32b) round keys present in the first 4x32b
+        // element group of those vectors.
+        "vsetivli x0, 4, e32, m1, ta, ma\n\t"
+        "vle32.v v10, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v11, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v12, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v13, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v14, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v15, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v16, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v17, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v18, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v19, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v20, (a3)\n\t"
+
+    "1:\n\t"
+        // t3: number of remaining 4B elements (which is a multiple of 4)
+        // e32: vector of 32/4B elements
+        // m1: LMUL=1
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // t2 receives the number of 4B elements in the vector
+        "vsetvli t2, t3, e32, m1, ta, ma\n\t"   // Vectors of 4B
+
+        // Load plain text from `src`, a full vector of 4B elements at a time.
+        "vle32.v v1, (a1)\n\t"
+
+        // Initial AddRoundKey
+        "vaesz.vs v1, v10\n\t"   // with round key w[ 0, 4]
+        // Middle rounds, vaesem performs
+        // SubBytes+ShiftRows+MixColumns+AddRoundKey
+        "vaesem.vs v1, v11\n\t"  // with round key w[ 4, 7]
+        "vaesem.vs v1, v12\n\t"  // with round key w[ 8,11]
+        "vaesem.vs v1, v13\n\t"  // with round key w[12,15]
+        "vaesem.vs v1, v14\n\t"  // with round key w[16,19]
+        "vaesem.vs v1, v15\n\t"  // with round key w[20,23]
+        "vaesem.vs v1, v16\n\t"  // with round key w[24,27]
+        "vaesem.vs v1, v17\n\t"  // with round key w[28,31]
+        "vaesem.vs v1, v18\n\t"  // with round key w[32,35]
+        "vaesem.vs v1, v19\n\t"  // with round key w[36,39]
+        // Final round, vaesef does
+        // SubBytes+ShiftRows+AddRoundKey,
+        // i.e., the same as vaesem except that MixColumns is not missing.
+        "vaesef.vs v1, v20\n\t"  // with round key w[40,43]
+
+        // Store cypher test
+        // a0 is the destination (updated)
+        "vse32.v v1, (a0)\n\t"
+
+        // t2 contains the number of 32b/4B elements processed
+        "sub t3, t3, t2\n\t"              // Decrement count (4B elements)
+
+        // Scale by 4 to get number of bytes
+        "slli t2, t2, 2\n\t"              // t2 (#bytes) <- t2 (#4B) * 4
+        "add a1, a1, t2\n\t"              // Increment source address (bytes)
+        "add a0, a0, t2\n\t"              // Increment target address (bytes)
+
+        "bnez t3, 1b\n\t"                 // Continue the loop?
+
+        // Return the number of bytes actually processed
+    "2:\n\t"
+        "mv a0, t0\n\t"  // 'n' bytes result, computed on entry.
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED size_t zvkned_aes128_encode_vs_lmul2(void *dest UNUSED, 
+    const void *src UNUSED, size_t n UNUSED, const uint8_t *round_keys UNUSED)
+{
+    __asm__ __volatile__ (
+        // a2 on input is number of bytes of the plaintext. We round it down
+        // to a multiple of 16 bytes (128b), keep that in t0 that we return.
+        "andi t0, a2, -16\n\t"  // 0xFF0 in two's complement, clear low 4 bits.
+        "beqz t0, 2f\n\t"  // Early exit in the "0 bytes to process" case
+        // t3 <- t0 / 4, number of remaining 4B elements
+        "srli t3, t0, 2\n\t"
+
+        // We load the 11 round keys into 11 vector register groups,
+        // v2-v22 (v2, v4, v6, ..., v22, 11 groups), with the 16B (4 words)
+        // with the 16B (4x32b) round keys present in the first 4x32b
+        // element group of those vectors.
+        "vsetivli x0, 4, e32, m2, ta, ma\n\t"
+        "vle32.v v2, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v4, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v6, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v8, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v10, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v12, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v14, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v16, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v18, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v20, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v22, (a3)\n\t"
+
+    "1:\n\t"
+        // t3: number of remaining 4B elements (which is 4*k)
+        // e32: vector of 32b/4B elements
+        // m2: LMUL=2
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // t2 receives the number of 4B elements in the vector
+        "vsetvli t2, t3, e32, m2, ta, ma\n\t"   // Vectors of 8b
+
+        // Load plain text from `src`.
+        "vle32.v v0, (a1)\n\t"
+
+        // Initial AddRoundKey
+        "vaesz.vs  v0,  v2\n\t"   // with round key w[ 0, 4]
+        // Middle rounds, vaesem performs
+        // SubBytes+ShiftRows+MixColumns+AddRoundKey
+        "vaesem.vs v0,  v4\n\t"  // with round key w[ 4, 7]
+        "vaesem.vs v0,  v6\n\t"  // with round key w[ 8,11]
+        "vaesem.vs v0,  v8\n\t"  // with round key w[12,15]
+        "vaesem.vs v0, v10\n\t"  // with round key w[16,19]
+        "vaesem.vs v0, v12\n\t"  // with round key w[20,23]
+        "vaesem.vs v0, v14\n\t"  // with round key w[24,27]
+        "vaesem.vs v0, v16\n\t"  // with round key w[28,31]
+        "vaesem.vs v0, v18\n\t"  // with round key w[32,35]
+        "vaesem.vs v0, v20\n\t"  // with round key w[36,39]
+        // Final round, vaesef does
+        // SubBytes+ShiftRows+AddRoundKey,
+        // i.e., the same as vaesem except that MixColumns is not missing.
+        "vaesef.vs v0, v22\n\t"  // with round key w[40,43]
+
+        // Store cypher test
+        // a0 is the destination (updated)
+        "vse32.v v0, (a0)\n\t"
+
+        // t2 contains the number of 32b/4B elements processed
+        "sub t3, t3, t2\n\t"              // Decrement count (4B elements)
+
+        // Scale by 4 to get number of bytes
+        "slli t2, t2, 2\n\t"              // t2 (#bytes) <- t2 (#4B) * 4
+        "add a1, a1, t2\n\t"              // Increment source address (bytes)
+        "add a0, a0, t2\n\t"              // Increment target address (bytes)
+
+        "bnez t3, 1b\n\t"                 // Continue the loop?
+
+        // Return the number of bytes actually processed
+    "2:\n\t"
+        "mv a0, t0\n\t\n\t"  // 'n' bytes result, computed on entry.
+
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED size_t zvkned_aes128_decode_vs_lmul1(void *dest UNUSED, 
+    const void *src UNUSED, size_t n UNUSED, const uint8_t *round_keys UNUSED)
+{
+    __asm__ __volatile__ (
+        // a2 on input is number of bytes of the plaintext. We round it down
+        // to a multiple of 16 bytes (128b), keep that in t0 that we return.
+        "andi t0, a2, -16\n\t"  // 0xFF0 in two's complement, clear low 4 bits.
+        "beqz t0, 2f\n\t"  // Early exit in the "0 bytes to process" case
+        // t3 <- t0 / 4, number of remaining 4B elements
+        "srli t3, t0, 2\n\t"
+
+        // We load the 11 round keys into 11 vector registers, v10-v20,
+        // with the 16B (4x32b) round keys present in the first 4x32b
+        // element group of those vectors.
+        // We use only even registers to enable the "lmul2" variant to use
+        // the same code, with only the vset[i]vli changed.
+        "vsetivli t2, 4, e32, m1, ta, ma\n\t"
+        "vle32.v v2, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v4, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v6, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v8, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v10, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v12, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v14, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v16, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v18, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v20, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v22, (a3)\n\t"
+
+    "1:\n\t"
+        // t3: number of remaining 4B elements (which is 4*k)
+        // e32: vector of 64b/8B elements
+        // m1: LMUL=1
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // t2 receives the number of 8B elements in the vector
+        "vsetvli t2, t3, e32, m1, ta, ma\n\t"   // Vectors of 4B
+
+        // v1 contains the text, from cipher to clear,
+        // v10-v20 contain the 11 per-round keys.
+
+        // Load cipher text from `src`, one vector full at a time.
+        "vle32.v v0, (a1)\n\t"
+
+        // Initial round, AddRoundKey
+        "vaesz.vs v0, v22\n\t"  // with round key w[43,47]
+        // Middle rounds, vaesdm performs
+        // InvShiftRows+InvSubBytes+AddRoundKey+InvMixColumns.
+        "vaesdm.vs v0, v20\n\t"  // with round key w[36,39]
+        "vaesdm.vs v0, v18\n\t"  // with round key w[32,35]
+        "vaesdm.vs v0, v16\n\t"  // with round key w[28,31]
+        "vaesdm.vs v0, v14\n\t"  // with round key w[24,27]
+        "vaesdm.vs v0, v12\n\t"  // with round key w[20,23]
+        "vaesdm.vs v0, v10\n\t"  // with round key w[16,19]
+        "vaesdm.vs v0, v8\n\t"  // with round key w[12,15]
+        "vaesdm.vs v0, v6\n\t"  // with round key w[ 8,11]
+        "vaesdm.vs v0, v4\n\t"  // with round key w[ 4, 7]
+        // Final round, vaesdf performs
+        // InvShiftRows+InvSubBytes+AddRoundKey,
+        // i.e., the same as vaesdm except that InvMixColumns is missing.
+        "vaesdf.vs v0, v2\n\t"  // with round key w[ 0, 4]
+
+        // Store clear test
+        // a0 is the destination (updated)
+        "vse32.v v0, (a0)\n\t"
+
+        // t2 contains the number of 32b/4B elements processed
+        "sub t3, t3, t2\n\t"  // Decrement count (4B elements)
+
+        // Scale by 4 to get number of bytes
+        "slli t2, t2, 2\n\t"  // t2 (#bytes) <- t2 (#4B) * 4
+        "add a1, a1, t2\n\t"  // Increment source address (bytes)
+        "add a0, a0, t2\n\t"  // Increment target address (bytes)
+
+        "bnez t3, 1b\n\t"     // Loop if text remains.
+
+        // Return the number of bytes actually processed
+    "2:\n\t"
+        "mv a0, t0\n\t"  // 'n' bytes result, computed on entry.
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED size_t zvkned_aes128_decode_vs_lmul2(void *dest UNUSED, 
+    const void *src UNUSED, size_t n UNUSED, const uint8_t *round_keys UNUSED)
+{
+    __asm__ __volatile__ (
+        // a2 on input is number of bytes of the plaintext. We round it down
+        // to a multiple of 16 bytes (128b), keep that in t0 that we return.
+        "andi t0, a2, -16\n\t"  // 0xFF0 in two's complement, clear low 4 bits.
+        "beqz t0, 2f\n\t"  // Early exit in the "0 bytes to process" case
+        // t3 <- t0 / 4, number of remaining 4B elements
+        "srli t3, t0, 2\n\t"
+
+        // We load the 11 round keys into 11 vector register groups, v2-v22,
+        // with the 16B (4x32b) round keys present in the first 4x32b
+        // element group of those vectors.
+        "vsetivli t2, 4, e32, m2, ta, ma\n\t"
+        "vle32.v v2, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v4, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v6, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v8, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v10, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v12, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v14, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v16, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v18, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v20, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v22, (a3)\n\t"
+
+    "1:\n\t"
+        // t3: number of remaining 4B elements (which is 4*k)
+        // e32: vector of 64b/8B elements
+        // m2: LMUL=2
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // t2 receives the number of 8B elements in the vector
+        "vsetvli t2, t3, e32, m2, ta, ma\n\t"   // Vectors of 4B
+
+        // v1 contains the text, from cipher to clear,
+        // v10-v20 contain the 11 per-round keys.
+
+        // Load cipher text from `src`, one vector full at a time.
+        "vle32.v v0, (a1)\n\t"
+
+        // Initial round, AddRoundKey
+        "vaesz.vs v0, v22\n\t"  // with round key w[43,47]
+        // Middle rounds, vaesdm performs
+        // InvShiftRows+InvSubBytes+AddRoundKey+InvMixColumns.
+        "vaesdm.vs v0, v20\n\t"  // with round key w[36,39]
+        "vaesdm.vs v0, v18\n\t"  // with round key w[32,35]
+        "vaesdm.vs v0, v16\n\t"  // with round key w[28,31]
+        "vaesdm.vs v0, v14\n\t"  // with round key w[24,27]
+        "vaesdm.vs v0, v12\n\t"  // with round key w[20,23]
+        "vaesdm.vs v0, v10\n\t"  // with round key w[16,19]
+        "vaesdm.vs v0, v8\n\t"  // with round key w[12,15]
+        "vaesdm.vs v0, v6\n\t"  // with round key w[ 8,11]
+        "vaesdm.vs v0, v4\n\t"  // with round key w[ 4, 7]
+        // Final round, vaesdf performs
+        // InvShiftRows+InvSubBytes+AddRoundKey,
+        // i.e., the same as vaesdm except that InvMixColumns is missing.
+        "vaesdf.vs v0, v2\n\t"  // with round key w[ 0, 4]
+
+        // Store clear test
+        // a0 is the destination (updated)
+        "vse32.v v0, (a0)\n\t"
+
+        // t2 contains the number of 32b/4B elements processed
+        "sub t3, t3, t2\n\t"  // Decrement count (4B elements)
+
+        // Scale by 4 to get number of bytes
+        "slli t2, t2, 2\n\t"  // t2 (#bytes) <- t2 (#4B) * 4
+        "add a1, a1, t2\n\t"  // Increment source address (bytes)
+        "add a0, a0, t2\n\t"  // Increment target address (bytes)
+
+        "bnez t3, 1b\n\t"     // Loop if text remains.
+
+        // Return the number of bytes actually processed
+    "2:\n\t"
+        "mv a0, t0\n\t"  // 'n' bytes result, computed on entry.
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED size_t zvkned_aes256_encode_vs_lmul1(void *dest UNUSED, 
+    const void *src UNUSED, size_t n UNUSED, const uint8_t *round_keys UNUSED)
+{
+    __asm__ __volatile__ (
+        // a2 on input is number of bytes of the plaintext. We round it down
+        // to a multiple of 16 bytes (128b), keep that in t0 that we return.
+        "andi t0, a2, -16\n\t"  // 0xFF0 in two's complement, clear low 4 bits.
+        "beqz t0, 2f\n\t"  // Early exit in the "0 bytes to process" case
+        // t3 <- t0 / 4, number of remaining 4B elements
+        "srli t3, t0, 2\n\t"
+
+        // We load the 15 round keys into 15 vector registers, v10-v24,
+        // with the 16B (4x32b) round keys present in the first 4x32b
+        // element group of those vectors.
+        "vsetivli x0, 4, e32, m1, ta, ma\n\t"
+        "vle32.v v10, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v11, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v12, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v13, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v14, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v15, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v16, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v17, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v18, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v19, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v20, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v21, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v22, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v23, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v24, (a3)\n\t"
+
+    "1:\n\t"
+        // t3: number of remaining 4B elements (which is a multiple of 4)
+        // e32: vector of 32b/4B elements
+        // m1: LMUL=1
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // t2 receives the number of 8B elements in the vector
+        "vsetvli t2, t3, e32, m1, ta, ma\n\t"   // Vectors of 4B
+
+        // v0 contains the text (from clear to cipher)
+        // Load plain text from `src`, 4B(*4) at a time
+        "vle32.v v0, (a1)\n\t"
+
+        // Round 0, Initial AddRoundKey of w[0, 3]
+        "vaesz.vs v0, v10\n\t"
+        // vaesem does SubBytes+ShiftRows+MixColumns+AddRoundKey of w[4*round .. 4*round+3]
+        "vaesem.vs v0, v11\n\t"  // v11 contains round 1 key, w[4, 7]
+        "vaesem.vs v0, v12\n\t"
+        "vaesem.vs v0, v13\n\t"
+        "vaesem.vs v0, v14\n\t"
+        "vaesem.vs v0, v15\n\t"
+        "vaesem.vs v0, v16\n\t"
+        "vaesem.vs v0, v17\n\t"
+        "vaesem.vs v0, v18\n\t"
+        "vaesem.vs v0, v19\n\t"
+        "vaesem.vs v0, v20\n\t"
+        "vaesem.vs v0, v21\n\t"
+        "vaesem.vs v0, v22\n\t"
+        "vaesem.vs v0, v23\n\t"
+        // Final round
+        // vaesef does SubBytes+ShiftRows+AddRoundKey of w[56,59]
+        // (same as vaesem except that MixColumns is not performed)
+        "vaesef.vs v0, v24\n\t"
+
+        // Store cypher test
+        // a0 is the destination (updated)
+        "vse32.v v0, (a0)\n\t"
+        // ret // Test a single write
+
+        // t2 contains the number of 32b/4B elements processed
+        "sub t3, t3, t2\n\t"              // Decrement count (4B elements)
+
+        // Scale by 8 to get number of bytes
+        "slli t2, t2, 2\n\t"              // t2 (#bytes) <- t2 (#4B) * 4
+        "add a1, a1, t2\n\t"              // Increment source address (bytes)
+        "add a0, a0, t2\n\t"              // Increment target address (bytes)
+
+        "bnez t3, 1b\n\t"                 // Continue the loop?
+
+        // Return the number of bytes actually processed
+    "2:\n\t"
+        "mv a0, t0\n\t"  // 'n' bytes result, computed on entry.
+        "ret\n\t"
+    );
+}
+
+inline ZVKNED_NAKED size_t zvkned_aes256_decode_vs_lmul1(void *dest UNUSED, 
+    const void *src UNUSED, size_t n UNUSED, const uint8_t *round_keys UNUSED)
+{
+    __asm__ __volatile__ (
+        // a2 on input is number of bytes of the plaintext. We round it down
+        // to a multiple of 16 bytes (128b), keep that in t0 that we return.
+        "andi t0, a2, -16\n\t"  // 0xFF0 in two's complement, clear low 4 bits.
+        "beqz t0, 2f\n\t"  // Early exit in the "0 bytes to process" case
+        // t3 <- t0 / 4, number of remaining 4B elements
+        "srli t3, t0, 2\n\t"
+
+        // We load the 15 round keys into 15 vector registers at even indices,
+        // v2-v30, with the 16B (4x32b) round keys present in the first 4x32b
+        // element group of those vectors.
+        "vsetivli x0, 4, e32, m1, ta, ma\n\t"
+        "vle32.v v2, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v4, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v6, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v8, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v10, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v12, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v14, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v16, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v18, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v20, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v22, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v24, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v26, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v28, (a3)\n\t"
+        "addi a3, a3, 16\n\t"
+        "vle32.v v30, (a3)\n\t"
+
+    "1:\n\t"
+        // t3: number of remaining 4B elements (which is even)
+        // e32: vector of 32b/4B elements
+        // m1: LMUL=1
+        // ta: tail agnostic (don't care about those elements)
+        // ma: mask agnostic (don't care about those elements)
+        // t2 receives the number of 8B elements in the vector
+        "vsetvli t2, t3, e32, m1, ta, ma\n\t"   // Vectors of 4B
+
+        // v1 will contain the text, from cipher to clear,
+        // v10-v24 contain the 15 per-round keys.
+
+        // Load cipher text from `src`, 8B(*2) at a time
+        "vle32.v v0, (a1)\n\t"
+
+        // Initial round, AddRoundKey
+        "vaesz.vs v0, v30\n\t"   // with round key w[56,59]
+        // Middle rounds, vaesdm performs
+        // InvShiftRows+InvSubBytes+AddRoundKey+InvMixColumns.
+        "vaesdm.vs v0, v28\n\t"  // with round key w[52,55]
+        "vaesdm.vs v0, v26\n\t"  // with round key w[48,51]
+        "vaesdm.vs v0, v24\n\t"  // with round key w[44,47]
+        "vaesdm.vs v0, v22\n\t"  // with round key w[40,43]
+        "vaesdm.vs v0, v20\n\t"  // with round key w[36,39]
+        "vaesdm.vs v0, v18\n\t"  // with round key w[32,35]
+        "vaesdm.vs v0, v16\n\t"  // with round key w[28,31]
+        "vaesdm.vs v0, v14\n\t"  // with round key w[24,27]
+        "vaesdm.vs v0, v12\n\t"  // with round key w[20,23]
+        "vaesdm.vs v0, v10\n\t"  // with round key w[16,19]
+        "vaesdm.vs v0, v8\n\t"   // with round key w[12,15]
+        "vaesdm.vs v0, v6\n\t"   // with round key w[ 8,11]
+        "vaesdm.vs v0, v4\n\t"   // with round key w[ 4, 7]
+        // Final round, vaesdf performs
+        // InvShiftRows+InvSubBytes+AddRoundKey,
+        // i.e., the same as vaesdm except that InvMixColumns is missing.
+        "vaesdf.vs v0, v2\n\t"  // with round key w[ 0, 4]
+
+        // Store clear test
+        // a0 is the destination (updated)
+        "vse32.v v0, (a0)\n\t"
+        // ret // Test a single write
+
+        // t2 contains the number of 32b/4B elements processed
+        "sub t3, t3, t2\n\t"              // Decrement count (4B elements)
+
+        // Scale by 8 to get number of bytes
+        "slli t2, t2, 2\n\t"              // t2 (#bytes) <- t2 (#4B) * 4
+        "add a1, a1, t2\n\t"              // Increment source address (bytes)
+        "add a0, a0, t2\n\t"              // Increment target address (bytes)
+
+        "bnez t3, 1b\n\t"                 // Continue the loop?
+
+        // Return the number of bytes actually processed
+    "2:\n\t"
+        "mv a0, t0\n\t"  // 'n' bytes result, computed on entry.
+        "ret\n\t"
+    );
+}
+
+
+inline void aes128_ecb_encrypt_zvkned(const uint8_t *input, 
+    uint8_t *output, size_t n, const uint8_t key[16])
+{
+    alignas(16) uint8_t round_keys[176];
+    if (n == 0)
+        return;
+    zvkned_aes128_expand_key(round_keys, key);
+    zvkned_aes128_encode_vs_lmul1(output, input, n, round_keys);
+}
+
+inline void aes256_ecb_encrypt_zvkned(const uint8_t *input, 
+    uint8_t *output, size_t n, const uint8_t key[32])
+{
+    alignas(16) uint8_t round_keys[240];
+    if (n == 0)
+        return;
+    zvkned_aes256_expand_key(round_keys, key);
+    zvkned_aes256_encode_vs_lmul1(output, input, n, round_keys);
+}
+
+inline void aes128_ecb_decrypt_zvkned(const uint8_t *input, 
+    uint8_t *output, size_t n, const uint8_t key[16])
+{
+    alignas(16) uint8_t round_keys[176];
+    if (n == 0)
+        return;
+    zvkned_aes128_expand_key(round_keys, key);
+    zvkned_aes128_decode_vs_lmul1(output, input, n, round_keys);
+}
+
+inline void aes256_ecb_decrypt_zvkned(const uint8_t *input, 
+    uint8_t *output, size_t n, const uint8_t key[32])
+{
+    alignas(16) uint8_t round_keys[240];
+    if (n == 0)
+        return;
+    zvkned_aes256_expand_key(round_keys, key);
+    zvkned_aes256_decode_vs_lmul1(output, input, n, round_keys);
+}
+
+inline void aes128_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
+    size_t n, const uint8_t key[16], const uint8_t iv[16])
+{
+    if (n == 0)
+        return;
+    assert(n % 16 == 0);
+
+    alignas(16) uint8_t round_keys[176];
+    zvkned_aes128_expand_key(round_keys, key);
+
+    alignas(16) uint8_t chain[16];
+    memcpy(chain, iv, 16);
+
+    for (size_t i = 0; i < n; i += 16)
+    {
+        // XOR plaintext with previous ciphertext
+        for (size_t j = 0; j < 16; ++j)
+            chain[j] ^= input[i + j];
+
+        // Encrypt one block using the existing ECB function
+        zvkned_aes128_encode_vs_lmul1(output + i, chain, 16, round_keys);
+
+        // Current ciphertext becomes the next chaining value
+        memcpy(chain, output + i, 16);
+    }
+}
+
+inline void aes256_cbc_encrypt_zvkned(const uint8_t *input, uint8_t *output,
+    size_t n, const uint8_t key[32], const uint8_t iv[16])
+{
+    if (n == 0)
+        return;
+    assert(n % 16 == 0);
+
+    alignas(16) uint8_t round_keys[240];
+    zvkned_aes256_expand_key(round_keys, key);
+    
+    alignas(16) uint8_t chain[16];
+    memcpy(chain, iv, 16);
+
+    for (size_t i = 0; i < n; i += 16)
+    {
+        // XOR plaintext with previous ciphertext
+        for (size_t j = 0; j < 16; ++j)
+            chain[j] ^= input[i + j];
+
+        // Encrypt one block using the existing ECB function
+        zvkned_aes256_encode_vs_lmul1(output + i, chain, 16, round_keys);
+
+        // Current ciphertext becomes the next chaining value
+        memcpy(chain, output + i, 16);
+    }
+}
+
+inline void aes128_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
+    size_t n, const uint8_t key[16], const uint8_t iv[16])
+{
+    if (n == 0)
+        return;
+    assert(n % 16 == 0);
+
+    alignas(16) uint8_t round_keys[176];
+    zvkned_aes128_expand_key(round_keys, key);
+
+    if (output != input)
+    {
+        // Decrypt all blocks in parallel
+        zvkned_aes128_decode_vs_lmul1(output, input, n, round_keys);
+
+        // XOR with IV
+        for (size_t j = 0; j < 16; ++j)
+            output[j] ^= iv[j];
+
+        // XOR with previous ciphertext blocks
+        for (size_t i = 16; i < n; i += 16)
+            for (size_t j = 0; j < 16; ++j)
+                output[i + j] ^= input[i + j - 16];
+
+        return;
+    }
+
+    // In-place decryption: process one block at a time
+    // Save the previous ciphertext before overwriting the current block
+    uint8_t chain[16];
+    uint8_t ciphertext[16];
+
+    memcpy(chain, iv, 16);
+
+    for (size_t i = 0; i < n; i += 16)
+    {
+        memcpy(ciphertext, input + i, 16);
+
+        zvkned_aes128_decode_vs_lmul1(output + i, ciphertext, 16, round_keys);
+        for (size_t j = 0; j < 16; ++j)
+            output[i + j] ^= chain[j];
+
+        memcpy(chain, ciphertext, 16);
+    }
+}
+
+inline void aes256_cbc_decrypt_zvkned(const uint8_t *input, uint8_t *output,
+    size_t n, const uint8_t key[32], const uint8_t iv[16])
+{
+    if (n == 0)
+        return;
+    assert(n % 16 == 0);
+
+    alignas(16) uint8_t round_keys[240];
+    zvkned_aes256_expand_key(round_keys, key);
+
+    if (output != input)
+    {
+        // Decrypt all blocks in parallel
+        zvkned_aes256_decode_vs_lmul1(output, input, n, round_keys);
+
+        // XOR with IV
+        for (size_t j = 0; j < 16; ++j)
+            output[j] ^= iv[j];
+
+        // XOR with previous ciphertext blocks
+        for (size_t i = 16; i < n; i += 16)
+            for (size_t j = 0; j < 16; ++j)
+                output[i + j] ^= input[i + j - 16];
+
+        return;
+    }
+
+    // In-place decryption: process one block at a time
+    // Save the previous ciphertext before overwriting the current block
+    uint8_t chain[16];
+    uint8_t ciphertext[16];
+
+    memcpy(chain, iv, 16);
+
+    for (size_t i = 0; i < n; i += 16)
+    {
+        memcpy(ciphertext, input + i, 16);
+
+        zvkned_aes256_decode_vs_lmul1(output + i, ciphertext, 16, round_keys);
+        for (size_t j = 0; j < 16; ++j)
+            output[i + j] ^= chain[j];
+
+        memcpy(chain, ciphertext, 16);
+    }
 }

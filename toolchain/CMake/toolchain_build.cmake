@@ -26,7 +26,7 @@ macro(build_gcc_multilib)
         endif()
         execute_process(COMMAND make clean
                         WORKING_DIRECTORY ${TOOLCHAIN_TOP}/riscv-gnu-toolchain/)
-        execute_process(COMMAND ./configure --prefix=${TOOLCHAIN_TOP}/GCC/multilib --with-arch=rv32im_zve32x --with-abi=ilp32 --enable-multilib   #Multilib build should include all valid configs for ANY benchmark for --with-arch
+        execute_process(COMMAND ./configure --prefix=${TOOLCHAIN_TOP}/GCC/multilib --with-arch=rv32imf_zve32f_zvkned --with-abi=ilp32 --enable-multilib   #Multilib build should include all valid configs for ANY benchmark for --with-arch
                         WORKING_DIRECTORY ${TOOLCHAIN_TOP}/riscv-gnu-toolchain/)
         execute_process(COMMAND make -j8 #Build crashes with -j${nproc}?
                         WORKING_DIRECTORY ${TOOLCHAIN_TOP}/riscv-gnu-toolchain/)

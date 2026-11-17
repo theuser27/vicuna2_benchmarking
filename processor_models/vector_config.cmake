@@ -2,8 +2,8 @@
 # Set configurations of the system here.  This is imported into CMAKE
 ###
 
-#Currently Supported: rv32im, rv32im_zve32x, rv32imf, rv32imf_zhf, rv32imf_zve32x, rv32imf_zve32f, rv32im_zve32x_zvbb, rv32im_zve32x_zvbc, rv32im_zve32x_zvbb_zvbc
-set(RISCV_ARCH "rv32im_zve32x")
+#Currently Supported: rv32im, rv32im_zve32x, rv32imf, rv32imf_zhf, rv32imf_zve32x, rv32imf_zve32f, rv32im_zve32x_zvbb, rv32im_zve32x_zvbc, rv32im_zve32x_zvbb_zvbc, rv32im_zve32x_zvkned
+set(RISCV_ARCH "rv32im_zve32x_zvkned")
 
 #Currently Supported: cv32e40x, cv32a60x
 set(SCALAR_CORE "cv32e40x")

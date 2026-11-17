@@ -63,7 +63,7 @@ set(MEM_LATENCY 1 CACHE STRING "Memory latency") #This should come from the vect
 set(TOOLCHAIN_TOP ${CMAKE_CURRENT_SOURCE_DIR}/../toolchain) #Top level path to toolchain folder
 set(VERILATOR_MODEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../processor_models/verilator) #Top level path to verilator model files
 set(GEM5_MODEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../processor_models/gem5)#Top level path to gem5 model files
-set(BUILD_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/build/${RISCV_ARCH}_zvl${VREG_W}b) #Top level path to program build folder
+set(BUILD_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/build/) #Top level path to program build folder
 
 #These control benchmark configurations specific to the selected RISCV_ARCH
 option(RISCV_F "Use the RISC-V F Extension" OFF)
@@ -99,6 +99,16 @@ elseif(${RISCV_ARCH} STREQUAL "rv32im_zve32x")
     set(RISCV_ZVE32X ON)
     set(AUTOVEC_FLAGS "")
     set(RISCV_ARCH_COMP_STRING ${RISCV_ARCH}_zvl${VREG_W}b)
+    option(FH_OPS      "Use FP16 for intermediate operations (no conversion to float)"  OFF)
+
+elseif(${RISCV_ARCH} STREQUAL "rv32im_zve32x_zvkned")
+    set(RISCV_ABI ilp32) 
+    set(RISCV_ZVE32X ON)
+    set(RISCV_ZVKNED ON)
+    set(AUTOVEC_FLAGS "")
+    # TODO: re-add the "zvl${VREG_W}b" when the fix for the C++ riscv vector intrinsics rolls out
+    # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=126803
+    set(RISCV_ARCH_COMP_STRING ${RISCV_ARCH})
     option(FH_OPS      "Use FP16 for intermediate operations (no conversion to float)"  OFF)
 
 elseif(${RISCV_ARCH} STREQUAL "rv32imf_zve32f")
